@@ -1,3 +1,4 @@
+// server.js (FULLY ES MODULE COMPATIBLE FIX)
 import express from "express";
 import session from "express-session";
 import passport from "passport";
@@ -5,82 +6,72 @@ import dotenv from "dotenv";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import flash from "connect-flash";
 import path from "path";
-import https from "https";
-import fs from "fs";
-import pgSession from "connect-pg-simple";
-import pg from "pg";
+import { createClient } from "redis";
+
+// 👇 FIX: Use curly braces for named import
+import { RedisStore } from "connect-redis"; 
 
 dotenv.config();
 
 const app = express();
 
 // -----------------------
-// POSTGRES SESSION STORE (for Vercel Postgres)
+// REDIS CLIENT SETUP
 // -----------------------
+let redisClient;
 let sessionStore;
 
-if (process.env.POSTGRES_URL) {
-  // Production: Use Vercel Postgres
-  const PgStore = pgSession(session);
-  const pgPool = new pg.Pool({
-    connectionString: process.env.POSTGRES_URL,
-    ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+if (process.env.KV_URL) {
+  // Production: Use Redis (Vercel KV / Upstash)
+  redisClient = createClient({
+    url: process.env.KV_URL,
   });
 
-  sessionStore = new PgStore({
-    pool: pgPool,
-    tableName: "session", // Default table name
-    createTableIfMissing: true, // Auto-create session table
+  redisClient.on("error", (err) => console.error("Redis Client Error", err));
+  redisClient.on("connect", () => console.log("✅ Redis Connected"));
+
+  redisClient.connect().catch(console.error);
+
+  // Initialize store using the imported Class
+  sessionStore = new RedisStore({
+    client: redisClient,
+    prefix: "sess:",
+    ttl: 14 * 24 * 60 * 60, // 14 days
   });
 
-  console.log("✅ Using Postgres session store (Vercel Postgres)");
+  console.log("✅ Using Redis session store (production)");
 } else {
-  // Development: No store (will use memory)
+  // Development: Use memory store (not for production!)
   sessionStore = undefined;
-  console.log("⚠️  Using in-memory sessions (development only)");
+  console.log("⚠️ Using in-memory sessions (development only)");
 }
 
 // -----------------------
-// HTTPS CONFIGURATION (Optional for Production)
+// MIDDLEWARE
 // -----------------------
-// If you have SSL certs, uncomment and use HTTPS
-/*
-const sslOptions = {
-  key: fs.readFileSync(path.resolve(__dirname, "certs/key.pem")),
-  cert: fs.readFileSync(path.resolve(__dirname, "certs/cert.pem"))
-};
-*/
-
-// -----------------------
-// 1. MIDDLEWARE
-// -----------------------
-
-// Serve static files from 'public'
 app.use(express.static(path.join(process.cwd(), "public")));
 
-// Session Middleware
 app.use(
   session({
     store: sessionStore,
-    secret: process.env.SESSION_SECRET || "your-secret-key-change-this",
+    secret: process.env.SESSION_SECRET || "change-this-secret",
     resave: false,
     saveUninitialized: false,
-    rolling: true, // Reset expiration on activity
+    rolling: true, // reset session expiration on activity
     cookie: {
-      secure: process.env.NODE_ENV === "production", // Only HTTPS in production
-      httpOnly: true, // Prevent client-side JS access
+      secure: process.env.NODE_ENV === "production", // HTTPS in production
+      httpOnly: true,
       maxAge: 14 * 24 * 60 * 60 * 1000, // 14 days
     },
   })
 );
 
-// Passport initialization
 app.use(passport.initialize());
 app.use(passport.session());
 app.use(flash());
 
 // -----------------------
-// 2. GOOGLE OAUTH STRATEGY
+// GOOGLE OAUTH STRATEGY
 // -----------------------
 passport.use(
   new GoogleStrategy(
@@ -95,13 +86,11 @@ passport.use(
         let role = "general";
         let isAuthorized = false;
 
-        // Condition 1: Official Student Email
         if (email.endsWith("@stu.pathfinder-mm.org")) {
           role = "student";
           isAuthorized = true;
         }
 
-        // Condition 2: Personal Gmail Exception
         if (email === "avagarimike11@gmail.com") {
           role = "student";
           isAuthorized = true;
@@ -125,16 +114,13 @@ passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((obj, done) => done(null, obj));
 
 // -----------------------
-// 3. AUTH ROUTES
+// AUTH ROUTES
 // -----------------------
-
-// Start Google OAuth login
 app.get(
   "/auth/google",
   passport.authenticate("google", { scope: ["profile", "email"] })
 );
 
-// Google OAuth callback
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", {
@@ -146,7 +132,6 @@ app.get(
   }
 );
 
-// Login failure route
 app.get("/auth/failure", (req, res) => {
   const messages = req.flash("error");
   const errorMessage = messages.length ? messages[0] : "Login failed.";
@@ -155,14 +140,13 @@ app.get("/auth/failure", (req, res) => {
 });
 
 // -----------------------
-// 4. PROTECTED ROUTES
+// PROTECTED ROUTES
 // -----------------------
 function ensureLoggedIn(req, res, next) {
   if (req.isAuthenticated()) return next();
   res.redirect("/index.html");
 }
 
-// Dashboard
 app.get("/dashboard", ensureLoggedIn, (req, res) => {
   const { name, email, role } = req.user;
   res.send(`
@@ -192,7 +176,6 @@ app.get("/dashboard", ensureLoggedIn, (req, res) => {
   `);
 });
 
-// Logout
 app.get("/logout", (req, res, next) => {
   req.logout((err) => {
     if (err) return next(err);
@@ -201,18 +184,7 @@ app.get("/logout", (req, res, next) => {
 });
 
 // -----------------------
-// 5. START SERVER
+// START SERVER
 // -----------------------
 const PORT = process.env.PORT || 3000;
-
-// If using HTTPS
-/*
-https.createServer(sslOptions, app).listen(PORT, () => {
-  console.log(`Server running securely on https://localhost:${PORT}`);
-});
-*/
-
-// Otherwise, HTTP
-app.listen(PORT, () => {
-  console.log(`✅ Server running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
