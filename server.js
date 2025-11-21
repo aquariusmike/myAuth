@@ -12,6 +12,25 @@ const app = express();
 // Session Middleware
 app.use(
   session({
+    // --- PRODUCTION SESSION STORE ---
+    store: MongoStore.create({
+      mongoUrl: "mongodb+srv://cluster0.zh2ic7j.mongodb.net/", // Use the MongoDB connection string
+      ttl: 14 * 24 * 60 * 60, // Session expiration (14 days)
+      collectionName: 'sessions',
+    }),
+    // --------------------------------
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+  })
+);
+// ... rest of your code
+
+
+
+// Session Middleware
+app.use(
+  session({
     secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
