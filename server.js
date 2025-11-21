@@ -4,36 +4,63 @@ import passport from "passport";
 import dotenv from "dotenv";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import flash from "connect-flash";
-import MongoStore from "connect-mongo"; // <-- REQUIRED FOR PRODUCTION SESSIONS
+import MongoStore from "connect-mongo";
+import path from "path";
+import https from "https";
+import fs from "fs";
 
 dotenv.config();
 
 const app = express();
 
 // -----------------------
+// HTTPS CONFIGURATION (Optional for Production)
+// -----------------------
+// If you have SSL certs, uncomment and use HTTPS
+/*
+const sslOptions = {
+  key: fs.readFileSync(path.resolve(__dirname, "certs/key.pem")),
+  cert: fs.readFileSync(path.resolve(__dirname, "certs/cert.pem"))
+};
+*/
+
+// -----------------------
 // 1. MIDDLEWARE
 // -----------------------
 
-// Session Middleware (Configured with MongoStore for Production Stability)
+// Serve static files from 'public'
+app.use(express.static(path.join(process.cwd(), "public")));
+
+// Session Middleware (MongoStore for Production)
 app.use(
   session({
-    // --- PRODUCTION SESSION STORE ---
     store: MongoStore.create({
-      mongoUrl: process.env.MONGO_URI, // Requires the MONGO_URI ENV variable
-      ttl: 14 * 24 * 60 * 60, // Session expiration (14 days)
-      collectionName: 'sessions',
+      mongoUrl: process.env.MONGO_URI,
+      ttl: 14 * 24 * 60 * 60, // 14 days
+      collectionName: "sessions",
+      touchAfter: 24 * 3600, // Lazy session update
+      autoRemove: "native", // Let MongoDB handle expired sessions
+      mongoOptions: {
+        serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
+        socketTimeoutMS: 45000,
+      }
     }),
-    // --------------------------------
-    secret: process.env.SESSION_SECRET, // Requires the SESSION_SECRET ENV variable
+    secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    rolling: true, // Reset expiration on activity
+    cookie: {
+      secure: process.env.NODE_ENV === "production", // Only HTTPS in production
+      httpOnly: true, // Prevent client-side JS access
+      maxAge: 14 * 24 * 60 * 60 * 1000, // 14 days
+    },
   })
 );
 
-// Passport and Flash Initialization
+// Passport initialization
 app.use(passport.initialize());
 app.use(passport.session());
-app.use(flash()); // Required to show unauthorized messages
+app.use(flash());
 
 // -----------------------
 // 2. GOOGLE OAUTH STRATEGY
@@ -46,32 +73,33 @@ passport.use(
       callbackURL: `${process.env.BASE_URL}/auth/google/callback`,
     },
     async (accessToken, refreshToken, profile, done) => {
-      const email = profile.emails[0].value;
+      try {
+        const email = profile.emails[0].value;
+        let role = "general";
+        let isAuthorized = false;
 
-      // --- AUTHORIZATION LOGIC ---
-      let role = "general";
-      let isAuthorized = false;
+        // Condition 1: Official Student Email
+        if (email.endsWith("@stu.pathfinder-mm.org")) {
+          role = "student";
+          isAuthorized = true;
+        }
 
-      // Condition 1: Official Student Email
-      if (email.endsWith("@stu.pathfinder-mm.org")) {
-        role = "student";
-        isAuthorized = true;
+        // Condition 2: Personal Gmail Exception
+        if (email === "avagarimike11@gmail.com") {
+          role = "student";
+          isAuthorized = true;
+        }
+
+        if (!isAuthorized) {
+          return done(null, false, {
+            message: "You are not a verified student of Pathfinder Institute Myanmar.",
+          });
+        }
+
+        return done(null, { email, name: profile.displayName, role });
+      } catch (err) {
+        return done(err, null);
       }
-
-      // Condition 2: Personal Gmail Exception
-      if (email === "avagarimike11@gmail.com") {
-        role = "student";
-        isAuthorized = true;
-      }
-
-      // --- REJECTION STEP: Deny unauthorized users ---
-      if (!isAuthorized) {
-        // Calling done(null, false) triggers failureRedirect and stores the flash message.
-        return done(null, false, { message: "You are not verified student of Pathfinder Institute Myanmar." });
-      }
-
-      // --- SUCCESS STEP ---
-      return done(null, { email, name: profile.displayName, role });
     }
   )
 );
@@ -80,98 +108,95 @@ passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((obj, done) => done(null, obj));
 
 // -----------------------
-// 3. ROUTES
+// 3. AUTH ROUTES
 // -----------------------
 
-// Serve static files from the 'public' directory
-app.use(express.static("public"));
-
-// Redirect to Google for authentication
+// Start Google OAuth login
 app.get(
   "/auth/google",
   passport.authenticate("google", { scope: ["profile", "email"] })
 );
 
-// Google Callback (Handles success and failure)
+// Google OAuth callback
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", {
-    failureRedirect: "/auth/failure", // Redirects to our dynamic failure route
-    failureFlash: true // Required to carry the rejection message
+    failureRedirect: "/auth/failure",
+    failureFlash: true,
   }),
   (req, res) => {
-    // Success: Redirect to dashboard
     res.redirect("/dashboard");
   }
 );
 
-// Handle Login Failure: Extracts flash message and redirects to index.html with error
+// Login failure route
 app.get("/auth/failure", (req, res) => {
   const messages = req.flash("error");
-  const errorMessage = messages.length > 0
-    ? messages[0]
-    : "Login failed.";
-  
-  // Redirect with the error message encoded in a query parameter
+  const errorMessage = messages.length ? messages[0] : "Login failed.";
   const encodedMessage = encodeURIComponent(errorMessage);
   res.redirect(`/index.html?authError=${encodedMessage}`);
 });
 
-// Middleware to protect dashboard (Ensure the user is logged in)
+// -----------------------
+// 4. PROTECTED ROUTES
+// -----------------------
 function ensureLoggedIn(req, res, next) {
   if (req.isAuthenticated()) return next();
-  res.redirect("/index.html"); // Redirect to index.html if not logged in
+  res.redirect("/index.html");
 }
 
-// Dashboard route (Renders HTML dynamically based on user role)
+// Dashboard
 app.get("/dashboard", ensureLoggedIn, (req, res) => {
   const { name, email, role } = req.user;
-
   res.send(`
     <html>
-    <head>
-      <title>Dashboard</title>
-      <style>
-        body { font-family: Arial; padding: 20px; }
-        .card { padding: 20px; border: 1px solid #ddd; border-radius: 10px; }
-        .stu { background: #e3f2fd; }
-        .gen { background: #fff3e0; }
-      </style>
-    </head>
-    <body>
-      <h2>Welcome ${name}</h2>
-      <p>Email: ${email}</p>
-      <p>Role: <b>${role}</b></p>
-
-      ${
-        role === "student"
-          ? `<div class="card stu"><h3>Student Docs Section</h3></div>`
-          : `<div class="card gen"><h3>Enrollment Section</h3></div>`
-      }
-
-      <br>
-      <a href="/logout">Logout</a>
-    </body>
+      <head>
+        <title>Dashboard</title>
+        <style>
+          body { font-family: Arial; padding: 20px; }
+          .card { padding: 20px; border: 1px solid #ddd; border-radius: 10px; margin-top: 20px; }
+          .stu { background: #e3f2fd; }
+          .gen { background: #fff3e0; }
+        </style>
+      </head>
+      <body>
+        <h2>Welcome ${name}</h2>
+        <p>Email: ${email}</p>
+        <p>Role: <b>${role}</b></p>
+        ${
+          role === "student"
+            ? `<div class="card stu"><h3>Student Docs Section</h3></div>`
+            : `<div class="card gen"><h3>Enrollment Section</h3></div>`
+        }
+        <br>
+        <a href="/logout">Logout</a>
+      </body>
     </html>
   `);
 });
 
-// Logout route
-app.get("/logout", (req, res) => {
+// Logout
+app.get("/logout", (req, res, next) => {
   req.logout((err) => {
-    if (err) {
-      console.error("Logout Error:", err);
-      return res.redirect("/");
-    }
-
-    req.session.destroy(() => {
-      // Successful logout: Redirect to index.html
-      res.redirect("/index.html");
-    });
+    if (err) return next(err);
+    req.session.destroy(() => res.redirect("/index.html"));
   });
 });
 
-// Start Server
-app.listen(3000, () =>
-  console.log("Server running on http://localhost:3000")
-);
+// -----------------------
+// 5. START SERVER
+// -----------------------
+const PORT = process.env.PORT || 3000;
+
+// If using HTTPS
+/*
+https.createServer(sslOptions, app).listen(PORT, () => {
+  console.log(`Server running securely on https://localhost:${PORT}`);
+});
+*/
+
+// Otherwise, HTTP
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`MongoDB session store initialized`);
+});
